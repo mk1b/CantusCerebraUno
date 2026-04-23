@@ -1,0 +1,12 @@
+1) Check out the discrepancy between the parameters. Like how come CSBrain has 4.9M with 12 layers, while our model has 12M for 12 layers !! This is unaccounted for.
+2) We must isolate the spectral encoder and check what this guy is doing and whether this converges or not.
+3) Check and compare the convergence rate of different models and our tmpenc.
+4) Find out a way to constrain the spectral encoder. Like we have specific
+5) Remove the wavelet transform for 75 -100 Hz because they don't exist as they are band passed to 0.1 to 75Hz. Also, when comparing across different datasets you will need to see the highest frequency that is avlbl.
+6) Cehck out the existing literature on wavelet transforms and eeg decoding. Find that one paper that used this thing.
+7) Get the calculation done for the TmpEncoder full evaluation and benchmarking done. We can use multiple systems to train this thing parallely. We need to be blazing fast if we are to make the deadline.
+The preference is more on the TmpEncoder. So like to everything in parallel, figure out the most optimal algorithm to iterate blazing fast.
+8) Apply for the various datasets as quick as possible. We need to fast-track this.
+9)
+ 
+

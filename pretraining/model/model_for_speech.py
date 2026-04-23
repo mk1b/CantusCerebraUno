@@ -1,0 +1,83 @@
+import torch
+import torch.distributed as dist
+import os
+import torch.nn
+import numpy as np
+import mne
+
+from model.CantusCerebraUno import *
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+hcp_positions_path = os.path.expanduser('~/CantusCerebra/data/HCP/positions_100_7.txt')
+connectivity_path = os.path.expanduser('~/CantusCerebra/processed_data/connectivity_matrix.txt')
+
+def sorted_maps():
+	ch_names = [
+    'Fp1', 'Fp2', 'F7', 'F3', 'Fz', 'F4', 'F8', 
+    'FC5', 'FC1', 'FC2', 'FC6', 'T7', 'C3', 'Cz', 'C4', 'T8', 
+    'TP9', 'CP5', 'CP1', 'CP2', 'CP6', 'TP10', 
+    'P7', 'P3', 'Pz', 'P4', 'P8', 'PO9', 'O1', 'Oz', 'O2', 'PO10', 
+    'AF7', 'AF3', 'AF4', 'AF8', 'F5', 'F1', 'F2', 'F6', 
+    'FT9', 'FT7', 'FC3', 'FC4', 'FT8', 'FT10', 
+    'C5', 'C1', 'C2', 'C6', 'TP7', 'CP3', 'CPz', 'CP4', 'TP8', 
+    'P5', 'P1', 'P2', 'P6', 'PO7', 'PO3', 'POz', 'PO4', 'PO8'
+]
+	
+	montage = mne.channels.make_standard_montage('standard_1005')
+	all_pos = montage.get_positions()['ch_pos']
+  
+	pos_array = np.array([all_pos[ch] for ch in ch_names]) * 1000
+	
+	brain_regions = np.loadtxt(hcp_positions_path)
+	used_pos = []
+	
+	for ch in ch_names:
+		pos = all_pos[ch] * 1000
+		idx = np.argmin(np.sum((brain_regions - pos)**2, axis=1))
+		
+		used_pos.append(idx)
+	 
+	correlations = np.loadtxt(connectivity_path)	
+	
+	sub_corr = correlations[np.ix_(used_pos, used_pos)]	
+	sorted_map = np.argsort(-sub_corr, axis=1)
+	
+	return torch.tensor(sorted_map)
+
+class Model(nn.Module):
+	def __init__(self, params):
+		super().__init__()
+		
+		self.backbone = CantusCerebraUno(sorted_maps(), d_model=params.d_model, convolution_set=params.convolution_set, stride=params.stride, in_dim=params.in_dim, out_dim=params.out_dim, dropout=params.dropout, d_ffn=params.d_ffn,
+	num_heads=params.num_heads, num_layers=params.num_layers, mother_wavelet=params.mother_wavelet, bands=params.bands, num_decoder_layers=params.num_decoder_layers, kernel_size=params.kernel_size, num_chans=params.num_chans)	
+		self.params = params
+		
+		if self.params.use_pretrained_weights:
+			map_location = self.device	
+			
+			state_dict = torch.load(self.params.state_dict_path, map_location=map_location)
+			new_state_dict = {k.replace('module.', ''):v for k, v in state_dict.items()}
+				
+			model_state_dict = self.backbone.state_dict()
+			matching_state_dict = {k:v for k, v in new_state_dict.items() if k in model_state_dict and v.size() == model_state_dict[k].size()}	
+			
+			model_state_dict.update(matching_state_dict)		
+			self.backbone.load_state_dict(model_state_dict)	
+			
+		self.FFN = nn.Sequential(
+						nn.Linear(200, 100),
+						nn.ELU(),
+						nn.Dropout(params.dropout),
+						nn.Linear(100, self.params.num_of_classes),
+					)
+						
+	def forward(self, x):
+		Bz, num_chans, num_patches, patch_size = x.shape
+		
+		emb = self.backbone(x)
+		emb = emb.mean(dim=(1, 2))
+		
+		out = self.FFN(emb)	
+		out = out.reshape(Bz)
+		
+		return out
