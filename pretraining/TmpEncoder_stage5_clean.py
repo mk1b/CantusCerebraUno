@@ -152,11 +152,11 @@ class BrainEmbedEEGLayer(nn.Module):
 		# Flawless!
 
 class TemporalAttention(nn.Module):
-	def __init__(self, d_model=200, nheads=8, dropout=0.1, batch_first=True, convolution_set=[(1,), (3,), (5,)]):
+	def __init__(self, d_model=200, num_heads=8, dropout=0.1, batch_first=True, convolution_set=[(1,), (3,), (5,)]):
 		super().__init__()
 		
 		self.convolution_set = convolution_set
-		self.attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=nheads, dropout=dropout, batch_first=batch_first)	
+		self.attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=num_heads, dropout=dropout, batch_first=batch_first)	
 	
 	def forward(self, x, is_causal=False, need_key_padding=False):
 		Bz, num_chans, num_patches, patch_size = x.shape
@@ -207,88 +207,58 @@ class TemporalAttention(nn.Module):
 		return final_out
 
 class RegionAttention(nn.Module):
-	def __init__(self, sorted_map, d_model=200, nheads=8, dropout=0.1, batch_first=True):
+	def __init__(self, sorted_map, d_model=200, num_heads=8, dropout=0.1, batch_first=True):
 		super().__init__()
 		self.register_buffer("sorted_map", sorted_map.long())
-		self.attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=nheads, dropout=dropout, batch_first=batch_first)
+		self.attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=num_heads, dropout=dropout, batch_first=batch_first)
 		self.group_transform = nn.Linear(d_model, d_model)
+		num_chans = self.sorted_map.shape[0]
+		num_groups = int(num_chans ** 0.5)
+		self.proj = nn.Linear(num_groups + int(num_chans % num_groups != 0), 1)
 		
 	def forward(self, x):
 		Bz, num_chans, num_patch, patch_size = x.shape
-
-		x = x.permute(0, 2, 1, 3).contiguous()
-		x = x.reshape(Bz * num_patch, num_chans, patch_size)
-		
-		num_complete_groups = num_chans // 4
-		num_electrodes_complete_groups = num_complete_groups * 4
-		
-		sorted_x = x[:, self.sorted_map, :]
-			
-		main_x = sorted_x[:, :, :num_electrodes_complete_groups, :]
-		rem_x = sorted_x[:, :, num_electrodes_complete_groups:, :]
-		
-		index = torch.arange(0, num_electrodes_complete_groups, 4, device=x.device)
-			
-		first_tensors = main_x[:, :, index, :]
-		grouped_x = main_x.reshape(Bz * num_patch, num_chans, num_complete_groups, 4, patch_size)
-		
-		groups = grouped_x.mean(dim=3)
-		rep = first_tensors + self.group_transform(groups)
-		
-		if num_chans != num_electrodes_complete_groups:
-			rem_rep = (rem_x[:, :, 0, :] * 2).unsqueeze(2)	
-			final_stacked = torch.cat([rep, rem_rep], dim=2)
+		num_groups = int(num_chans ** 0.5)
+		num_leftovers = num_chans % num_groups
+		num_complete = num_chans - num_leftovers
+		sorted_x = x.permute(0, 2, 1, 3)
+		sorted_x = sorted_x.reshape(Bz * num_patch, num_chans, patch_size)
+		sorted_x = sorted_x[:, self.sorted_map, :]
+		group_size = num_complete // num_groups
+		complete_x = sorted_x[:, :, :num_complete, :]
+		complete_x = complete_x.reshape(Bz * num_patch, num_chans, group_size, num_groups, patch_size)
+		group_mean = torch.mean(complete_x, dim=2)
+		if num_leftovers != 0:
+			rem_x = sorted_x[:, :, num_complete:, :]
+			rem_x = rem_x.reshape(Bz * num_patch, num_chans, num_leftovers, 1, patch_size)
+			rem_mean = torch.mean(rem_x, dim=2)
+			flat = torch.cat([group_mean, rem_mean], dim=2)
+			final_flat = self.group_transform(flat)
 		else:
-			final_stacked = rep
-
-		num_groups = final_stacked.shape[2]
-		
-		final_flat = final_stacked.reshape(Bz * num_patch * num_chans, num_groups, patch_size)
-		attn_out = self.attn(final_flat, final_flat, final_flat)[0]
-		
-		attn_out = attn_out.reshape(Bz, num_patch, num_chans, num_groups, patch_size)
-		
-		updated = attn_out[:, :, :, 0, :]
-		updated = updated.permute(0, 2, 1, 3)
-		
-		return updated
-
-def sorted_maps():
-	ch_names = [
-	'Fp1', 'F7', 'T7', 'P7', 'O1', 
-	'Fp2', 'F8', 'T8', 'P8', 'O2', 
-	'F3', 'C3', 'P3', 'F4', 'C4', 'P4'
-]
-	
-	montage = mne.channels.make_standard_montage('standard_1005')
-	all_pos = montage.get_positions()['ch_pos']
-  
-	# mapped_pos = {}
-	pos_array = np.array([all_pos[ch] for ch in ch_names]) * 1000
-	
-	brain_regions = np.loadtxt(hcp_positions_path)
-	used_pos = []
-	
-	for ch in ch_names:
-		pos = all_pos[ch] * 1000
-		idx = np.argmin(np.sum((brain_regions - pos)**2, axis=1))
-		
-		used_pos.append(idx)
-	 
-	correlations = np.loadtxt(connectivity_path)
-	
-	sub_corr = correlations[np.ix_(used_pos, used_pos)]
-	sorted_map = np.argsort(-sub_corr, axis=1)
-	
-	return torch.tensor(sorted_map)
+			final_flat = self.group_transform(group_mean)
+		#first_indices = torch.arange(0, num_groups, 1).to(x.device)	
+		#first_tensors = sorted_x[:, :, first_indices, :]
+		#if num_leftovers != 0:
+		#	last_index = torch.tensor([num_complete]).to(x.device)
+		#	last_tensor = sorted_x[:, :, last_index, :]
+		#	first_tensors = torch.cat([first_tensors, last_tensor], dim=2)
+		#final_flat = first_tensors + final_flat
+		final_num_groups = final_flat.shape[2]
+		final_flat = final_flat.reshape(-1, final_num_groups, patch_size)
+		out = self.attn(final_flat, final_flat, final_flat)[0]
+		out = out.permute(0, 2, 1).contiguous()
+		out = self.proj(out).squeeze(-1)
+		out = out.reshape(Bz, num_patch, num_chans, patch_size)
+		out = out.permute(0, 2, 1, 3).contiguous()
+		return out		
 
 class TransformerTemporalEncoderLayer(nn.Module):
-	def __init__(self, sorted_map, in_dim=200, out_dim=200, d_model=200, nheads=8, dropout=0.1, batch_first=True, convolution_set=[(1,), (3,), (5,)], d_ffn=800):
+	def __init__(self, sorted_map, in_dim=200, out_dim=200, d_model=200, num_heads=8, dropout=0.1, batch_first=True, convolution_set=[(1,), (3,), (5,)], d_ffn=800):
 		super().__init__()
 		
 		self.register_buffer('sorted_map', sorted_map.long())
-		self.TemporalAttention = TemporalAttention(d_model, nheads, dropout, batch_first, convolution_set)
-		self.RegionAttention = RegionAttention(sorted_map, d_model=d_model, nheads=nheads, dropout=dropout, batch_first=batch_first)
+		self.TemporalAttention = TemporalAttention(d_model, num_heads, dropout, batch_first, convolution_set)
+		self.RegionAttention = RegionAttention(sorted_map, d_model=d_model, num_heads=num_heads, dropout=dropout, batch_first=batch_first)
 		self._ff_block = _ff_block(d_model=d_model, d_ffn=d_ffn)
 		
 		self.norm1 = nn.LayerNorm(d_model)
@@ -309,7 +279,7 @@ class TransformerTemporalEncoderLayer(nn.Module):
 		return x
 
 class Final(nn.Module):
-	def __init__(self, sorted_map, d_model=200, convolution_set=[(1,), (3,), (5,)], stride=1, in_dim=200, out_dim=200, dropout=0.1, batch_first=True, d_ffn=800, nheads=8, num_layers=6):
+	def __init__(self, sorted_map, d_model=200, convolution_set=[(1,), (3,), (5,)], stride=1, in_dim=200, out_dim=200, dropout=0.1, batch_first=True, d_ffn=800, num_heads=8, num_layers=6):
 		super().__init__()
 		self.register_buffer('sorted_map', sorted_map)
 		
@@ -324,7 +294,7 @@ class Final(nn.Module):
 		self.BrainEmbedEEGLayers = nn.ModuleList([BrainEmbedEEGLayer(sorted_map=sorted_map, d_model=d_model, convolution_set=convolution_set) for _ in range(self.num_layers)])
 		
 		self.TransformerTemporalEncoderLayers = nn.ModuleList([TransformerTemporalEncoderLayer(sorted_map, in_dim=in_dim, out_dim=out_dim, d_model=d_model,
-													nheads=nheads, dropout=dropout, batch_first=batch_first, convolution_set=convolution_set, d_ffn=d_ffn) for _ in range(num_layers)])
+													num_heads=num_heads, dropout=dropout, batch_first=batch_first, convolution_set=convolution_set, d_ffn=d_ffn) for _ in range(num_layers)])
 		self.proj_out = nn.Linear(d_model, out_dim)
 		
 	def forward(self, x, mask=None, is_causal=False, need_key_padding=False):
